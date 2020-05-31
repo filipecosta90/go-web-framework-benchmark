@@ -193,7 +193,8 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
         if debug:
             print("Terminating {} process".format(web_framework))
         web_framework_process.terminate()
-        web_framework_process.wait()
+        # Wait for web_framework_process process to terminate, set timeout to 5 secs
+        web_framework_process.wait(5)
         if debug:
             print("{} process exited successfully".format(web_framework))
 
