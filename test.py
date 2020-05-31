@@ -50,7 +50,7 @@ def required_utilities(utility_list, debug):
     return result
 
 
-def wait_for_webserver(endpoint, debug, retries=10):
+def wait_for_webserver(endpoint, debug, retries=5):
     result = False
     while retries > 0:
         try:
