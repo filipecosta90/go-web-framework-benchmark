@@ -185,9 +185,9 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
     if debug:
         if wrk_process.poll() is None:
             print("wrk process is alive")
-
-    wrk_output = wrk_process.communicate()[0]
-    result_data = process_wrk_output(wrk_output)
+    if wrk_process.poll() is None:
+        wrk_output = wrk_process.communicate()[0]
+        result_data = process_wrk_output(wrk_output)
 
     try:
         if debug:
