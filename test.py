@@ -5,6 +5,7 @@
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import subprocess
@@ -14,6 +15,7 @@ import urllib.request
 
 import cpuinfo
 import humanize
+from tqdm import tqdm
 
 
 def whereis(program):
@@ -36,71 +38,113 @@ def numa_capable():
 
 
 # Check if system has the required utilities: wrk, numactl etc
-def required_utilities(utility_list):
-    required_utilities = 1
+def required_utilities(utility_list, debug):
+    result = 1
     for index in utility_list:
         if whereis(index) == None:
-            print('Cannot locate ' + index + ' in path!')
-            required_utilities = 0
-        else:
+            if debug:
+                print('Cannot locate ' + index + ' in path!')
+            result = 0
+        elif debug:
             print('Found ' + index + ' at ' + whereis(index))
-    return required_utilities
+    return result
 
 
-def wait_for_webserver(endpoint, retries=10):
+def wait_for_webserver(endpoint, debug, retries=10):
     result = False
     while retries > 0:
         try:
             urllib.request.urlopen(endpoint).read()
             return True
         except urllib.error.URLError as e:
-            print("...waiting for webserver to be ready")
+            if debug:
+                print("...waiting for webserver to be ready")
             time.sleep(0.1)
             retries -= 1
     return result
 
 
+def get_raw_uncorrected_latency_histogram(decoded_raw):
+    uncorrected_lines = []
+    within_line_interval = False
+    for line in decoded_raw.split("\n"):
+        # print(line)
+        if "Latency Distribution (HdrHistogram - Uncorrected Latency (measured without taking delayed starts into account))" in line:
+            within_line_interval = True
+        if "----------------------------------------------------------" in line:
+            within_line_interval = False
+        if within_line_interval:
+            uncorrected_lines.append(line)
+
+    return uncorrected_lines
+
+
+def get_raw_corrected_latency_histogram(decoded_raw):
+    corrected_lines = []
+    within_line_interval = False
+    for line in decoded_raw.split("\n"):
+        if "Latency Distribution (HdrHistogram - Recorded Latency)" in line:
+            within_line_interval = True
+        if "----------------------------------------------------------" in line:
+            within_line_interval = False
+        if within_line_interval:
+            corrected_lines.append(line)
+
+    return corrected_lines
+
+
 def process_wrk_output(raw_output):
     decoded_raw = raw_output.decode()
-    result = {"0.000000": None, "0.500000": None, "0.900000": None, "0.950000": None, "0.987500": None,
-              "1.000000": None}
-    for res in result.keys():
-        result[res] = extract_latency(decoded_raw, res)
+    result = {"corrected": {}, "uncorrected": {}}
+    uncorrected_latency_histogram = get_raw_uncorrected_latency_histogram(decoded_raw)
+    corrected_latency_histogram = get_raw_corrected_latency_histogram(decoded_raw)
+    for line in uncorrected_latency_histogram:
+        quantile, latency = extract_latency(line)
+        if quantile is not None:
+            result["uncorrected"][quantile] = latency
+    for line in corrected_latency_histogram:
+        quantile, latency = extract_latency(line)
+        if quantile is not None:
+            result["corrected"][quantile] = latency
     result["rps"] = None
     rps_regex = re.search(
         '.*Requests\/sec:\s+(\d+.?\d*).*', decoded_raw)
     if rps_regex is not None:
         result["rps"] = float(rps_regex.group(1))
 
-    print(decoded_raw)
+    # print(decoded_raw)
 
     return result
 
 
-def extract_latency(decoded_raw, latency_str):
+def extract_latency(decoded_raw):
     latency = None
+    quantile = None
     regex_lat = re.search(
-        '\s+(\d+.\d+)\s+({})\s+(\d+)\s+(\d+.\d+)'.format(latency_str), decoded_raw)
+        '\s+(\d+.\d+)\s+(\d+.\d+)\s+(\d+)\s+(\d+.\d+)', decoded_raw)
     if regex_lat is not None:
         latency = float(regex_lat.group(1))
+        quantile = float(regex_lat.group(2))
     else:
         regex_lat = re.search(
-            '\s+(\d+.\d+)\s+({})\s+(\d+)\s+inf'.format(latency_str), decoded_raw)
+            '\s+(\d+.\d+)\s+(\d+.\d+)\s+(\d+)\s+inf', decoded_raw)
         if regex_lat is not None:
             latency = float(regex_lat.group(1))
-    return latency
+            quantile = float(regex_lat.group(2))
+    return quantile, latency
 
 
 def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing_time_mock_ms, wrk_threads, connections,
                        max_rps,
                        duration_secs, endpoint, enable_cpu_affinity, taskset_web_framework_cpus_list,
-                       taskset_wrk_cpus_list,
+                       taskset_wrk_cpus_list, debug,
                        extra_wrk_args=[]):
     result = False
     result_data = None
-    print("Testing web framework: {}, with processing time {} ms, and total of {} connections".format(web_framework,
-                                                                                                      processing_time_mock_ms,
-                                                                                                      connections))
+    if debug:
+        print("Testing web framework: {}, with processing time {} ms, and total of {} connections".format(web_framework,
+                                                                                                          processing_time_mock_ms,
+                                                                                                          connections))
     server_path = os.path.abspath("./{server_bin_name}".format(server_bin_name=server_bin_name))
     environ = os.environ.copy()
     stdoutPipe = subprocess.PIPE
@@ -116,7 +160,7 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
     if enable_cpu_affinity and taskset_wrk_cpus_list is not None:
         wrk_args += ["taskset", "-c", ",".join(["{}".format(x) for x in taskset_wrk_cpus_list])]
     wrk_args += [wrk_full_path, "-t{}".format(wrk_threads), "-c{}".format(connections), "-R{}".format(max_rps),
-                 "-d{}s".format(duration_secs), "--latency", endpoint]
+                 "-d{}s".format(duration_secs), "--u_latency", endpoint]
     wrk_args += extra_wrk_args
 
     options = {
@@ -127,25 +171,31 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
     }
 
     web_framework_process = subprocess.Popen(args=web_framework_args, **options)
-    print("Waiting for web framework to be ready...")
-    wait_for_webserver(endpoint)
-    print("Ready to benchmark...")
+    if debug:
+        print("Waiting for web framework to be ready...")
+    wait_for_webserver(endpoint, debug)
+    if debug:
+        print("Ready to benchmark...")
 
-    if web_framework_process.poll() is None:
-        print("web framework process is alive")
+    if debug:
+        if web_framework_process.poll() is None:
+            print("web framework process is alive")
 
     wrk_process = subprocess.Popen(args=wrk_args, **options)
-    if wrk_process.poll() is None:
-        print("wrk process is alive")
+    if debug:
+        if wrk_process.poll() is None:
+            print("wrk process is alive")
 
     wrk_output = wrk_process.communicate()[0]
     result_data = process_wrk_output(wrk_output)
 
     try:
-        print("Terminating {} process".format(web_framework))
+        if debug:
+            print("Terminating {} process".format(web_framework))
         web_framework_process.terminate()
         web_framework_process.wait()
-        print("{} process exited successfully".format(web_framework))
+        if debug:
+            print("{} process exited successfully".format(web_framework))
 
     except OSError as e:
         print('OSError caught while waiting for {0} process to end: {1}'.format(web_framework, e.__str__()))
@@ -169,12 +219,14 @@ if __name__ == "__main__":
     parser.add_argument('--sleep-between-runs-secs', type=int, default=15,
                         help='sleep between runs')
     parser.add_argument('--enable-cpu-affinity', default=False, action='store_true')
+    parser.add_argument('--debug', default=False, action='store_true')
     parser.add_argument('--wrk-connections', type=str, default="1,100,500,5000",
                         help='different wrk total connections to simulate')
     parser.add_argument('--web-framework-processing-time-ms', type=str, default="0,10,30,100,500,-1",
                         help='web framework processing times to simulate. -1 is a special case for cpu bound testing ( via pow )')
     parser.add_argument('--server-bin-name', type=str, default="gowebbenchmark")
     parser.add_argument('--endpoint', type=str, default="http://127.0.0.1:8080/hello")
+    parser.add_argument('--output-file', type=str, default="results.json")
     parser.add_argument('--stress-rps', type=int, default=5000000,
                         help="RPS limit that is not supposed to be achievable. All frameworks should achieve it\'s stress point bellow this value")
 
@@ -192,10 +244,10 @@ if __name__ == "__main__":
         wrk_max_procs = total_cores - web_framework_max_procs
 
     total_benchmark_cpus = wrk_max_procs + web_framework_max_procs
-    benchmark_cpus_list = range(0, total_benchmark_cpus)
-    web_framework_cpus_list = benchmark_cpus_list[0:web_framework_max_procs] if args.enable_cpu_affinity else []
-    wrk_cpus_list = benchmark_cpus_list[
-                    web_framework_max_procs:total_benchmark_cpus] if args.enable_cpu_affinity else []
+    benchmark_cpus_list = list(range(0, total_benchmark_cpus))
+    web_framework_cpus_list = list(benchmark_cpus_list[0:web_framework_max_procs]) if args.enable_cpu_affinity else []
+    wrk_cpus_list = list(benchmark_cpus_list[
+                         web_framework_max_procs:total_benchmark_cpus]) if args.enable_cpu_affinity else []
 
     print("Using a total of {} CPUs out of the machine {} CPUs. cpus list: {}".format(total_benchmark_cpus, total_cores,
                                                                                       " ".join(["{}".format(x) for x in
@@ -211,8 +263,8 @@ if __name__ == "__main__":
     test_connections = [int(x) for x in args.wrk_connections.split(",")]
     processing_times_ms = [int(x) for x in args.web_framework_processing_time_ms.split(",")]
     web_frameworks = args.test_frameworks.split(",")
-
-    total_time = len(web_frameworks) * len(processing_times_ms) * len(test_connections) * (
+    total_tests = len(web_frameworks) * len(processing_times_ms) * len(test_connections)
+    total_time = total_tests * (
             args.test_duration_secs + args.sleep_between_runs_secs)
     print("Testing {} distinct frameworks".format(len(web_frameworks)))
     print("Total expected benchmark time {}".format(humanize.naturaldelta(dt.timedelta(seconds=total_time))))
@@ -221,7 +273,7 @@ if __name__ == "__main__":
     if args.enable_cpu_affinity:
         required_utilities_list.append('taskset')
 
-    if required_utilities(required_utilities_list) == 0:
+    if required_utilities(required_utilities_list, args.debug) == 0:
         print('Utilities Missing! Exiting..')
         sys.exit(1)
 
@@ -231,20 +283,39 @@ if __name__ == "__main__":
             " You should adjust CPU pinning in accordance. Don\'t this benchmark as is for NUMA setups!!")
 
     wrk_full_path = whereis("wrk")
-    # for web_framework in web_frameworks:
-    for web_framework in ["chi"]:
+
+    overall_results = {"machine_info": info, "wrk_max_procs": wrk_max_procs, "wrk_cpus_list": wrk_cpus_list,
+                       "web_framework_max_procs": web_framework_max_procs,
+                       "web_framework_cpus_list": web_framework_cpus_list}
+    progress = tqdm(unit="tests", total=total_tests)
+    for web_framework in web_frameworks:
+        overall_results[web_framework] = {}
         for test_connection in test_connections:
+            connection_key = "connections-{}".format(test_connection)
+            overall_results[web_framework][connection_key] = {}
             for processing_time_ms in processing_times_ms:
+                processing_time_key = "mocked-processing-time-{}-ms".format(processing_time_ms)
                 test_wrk_max_procs = wrk_max_procs
                 if test_connection < wrk_max_procs:
                     print("Setting threads to {}, given than number of connections ({}) must be >= threads ({})".format(
                         test_connection, test_connection, wrk_max_procs))
                     test_wrk_max_procs = test_connection
+
                 status, result_data = test_web_framework(wrk_full_path, args.server_bin_name, web_framework,
                                                          processing_time_ms, test_wrk_max_procs, test_connection,
                                                          args.stress_rps,
                                                          args.test_duration_secs,
                                                          args.endpoint, args.enable_cpu_affinity,
-                                                         web_framework_cpus_list, wrk_cpus_list)
-                print(result_data)
+                                                         web_framework_cpus_list, wrk_cpus_list, args.debug)
+                overall_results[web_framework][connection_key][processing_time_key] = result_data
+                progress.update()
+                print("Framework {}, connections {}, mocked processing time {} ms. RPS {} rps".format(web_framework,
+                                                                                                      test_connection,
+                                                                                                      processing_time_ms,
+                                                                                                      result_data[
+                                                                                                          "rps"]))
                 time.sleep(args.sleep_between_runs_secs)
+    progress.close()
+
+    with open(args.output_file, "w") as json_file:
+        json.dump(overall_results, json_file)
