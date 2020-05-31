@@ -112,8 +112,6 @@ def process_wrk_output(raw_output):
     if rps_regex is not None:
         result["rps"] = float(rps_regex.group(1))
 
-    # print(decoded_raw)
-
     return result
 
 
@@ -137,7 +135,7 @@ def extract_latency(decoded_raw):
 def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing_time_mock_ms, wrk_threads, connections,
                        max_rps,
                        duration_secs, endpoint, enable_cpu_affinity, taskset_web_framework_cpus_list,
-                       taskset_wrk_cpus_list, debug,
+                       taskset_wrk_cpus_list, debug, pipeline_size,
                        extra_wrk_args=[]):
     result = False
     result_data = None
@@ -146,6 +144,7 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
                                                                                                           processing_time_mock_ms,
                                                                                                           connections))
     server_path = os.path.abspath("./{server_bin_name}".format(server_bin_name=server_bin_name))
+    lua_path = os.path.abspath("./pipeline.lua")
     environ = os.environ.copy()
     stdoutPipe = subprocess.PIPE
     stderrPipe = subprocess.STDOUT
@@ -160,7 +159,8 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
     if enable_cpu_affinity and taskset_wrk_cpus_list is not None:
         wrk_args += ["taskset", "-c", ",".join(["{}".format(x) for x in taskset_wrk_cpus_list])]
     wrk_args += [wrk_full_path, "-t{}".format(wrk_threads), "-c{}".format(connections), "-R{}".format(max_rps),
-                 "-d{}s".format(duration_secs), "--u_latency", endpoint]
+                 "-d{}s".format(duration_secs), "--u_latency", endpoint, "-s", lua_path, "--", "/hello",
+                 "{}".format(pipeline_size)]
     wrk_args += extra_wrk_args
 
     options = {
@@ -219,14 +219,17 @@ if __name__ == "__main__":
     parser.add_argument('--sleep-between-runs-secs', type=int, default=15,
                         help='sleep between runs')
     parser.add_argument('--enable-cpu-affinity', default=False, action='store_true')
+    parser.add_argument('--disable-test-pipeline', default=False, action='store_true')
     parser.add_argument('--debug', default=False, action='store_true')
     parser.add_argument('--wrk-connections', type=str, default="1,100,500,5000",
                         help='different wrk total connections to simulate')
     parser.add_argument('--web-framework-processing-time-ms', type=str, default="0,10,30,100,500,-1",
                         help='web framework processing times to simulate. -1 is a special case for cpu bound testing ( via pow )')
     parser.add_argument('--server-bin-name', type=str, default="gowebbenchmark")
-    parser.add_argument('--endpoint', type=str, default="http://127.0.0.1:8080/hello")
+    parser.add_argument('--endpoint', type=str, default="http://127.0.0.1:8080")
     parser.add_argument('--output-file', type=str, default="results.json")
+    parser.add_argument('--pipeline-sizes', type=str, default="1,5,10,20",
+                        help='different pipeline sizes to test for')
     parser.add_argument('--stress-rps', type=int, default=5000000,
                         help="RPS limit that is not supposed to be achievable. All frameworks should achieve it\'s stress point bellow this value")
 
@@ -262,8 +265,9 @@ if __name__ == "__main__":
 
     test_connections = [int(x) for x in args.wrk_connections.split(",")]
     processing_times_ms = [int(x) for x in args.web_framework_processing_time_ms.split(",")]
+    test_pipelines = [int(x) for x in args.pipeline_sizes.split(",")]
     web_frameworks = args.test_frameworks.split(",")
-    total_tests = len(web_frameworks) * len(processing_times_ms) * len(test_connections)
+    total_tests = len(web_frameworks) * len(processing_times_ms) * len(test_connections) * len(test_pipelines)
     total_time = total_tests * (
             args.test_duration_secs + args.sleep_between_runs_secs)
     print("Testing {} distinct frameworks".format(len(web_frameworks)))
@@ -300,21 +304,30 @@ if __name__ == "__main__":
                     print("Setting threads to {}, given than number of connections ({}) must be >= threads ({})".format(
                         test_connection, test_connection, wrk_max_procs))
                     test_wrk_max_procs = test_connection
-
-                status, result_data = test_web_framework(wrk_full_path, args.server_bin_name, web_framework,
-                                                         processing_time_ms, test_wrk_max_procs, test_connection,
-                                                         args.stress_rps,
-                                                         args.test_duration_secs,
-                                                         args.endpoint, args.enable_cpu_affinity,
-                                                         web_framework_cpus_list, wrk_cpus_list, args.debug)
-                overall_results[web_framework][connection_key][processing_time_key] = result_data
-                progress.update()
-                print("Framework {}, connections {}, mocked processing time {} ms. RPS {} rps".format(web_framework,
-                                                                                                      test_connection,
-                                                                                                      processing_time_ms,
-                                                                                                      result_data[
-                                                                                                          "rps"]))
-                time.sleep(args.sleep_between_runs_secs)
+                overall_results[web_framework][connection_key][processing_time_key] = {}
+                for pipeline in test_pipelines:
+                    pipeline_key = "pipeline-{}".format(pipeline)
+                    overall_results[web_framework][connection_key][processing_time_key][pipeline_key] = {}
+                    status, result_data = test_web_framework(wrk_full_path, args.server_bin_name, web_framework,
+                                                             processing_time_ms, test_wrk_max_procs, test_connection,
+                                                             args.stress_rps,
+                                                             args.test_duration_secs,
+                                                             args.endpoint, args.enable_cpu_affinity,
+                                                             web_framework_cpus_list, wrk_cpus_list, args.debug,
+                                                             pipeline)
+                    overall_results[web_framework][connection_key][processing_time_key][pipeline_key] = result_data
+                    progress.update()
+                    q50 = result_data[
+                        "uncorrected"][0.5]
+                    print(
+                        "Framework {}, connections {}, mocked processing time {} ms, pipeline {}. RPS {} rps. q50 {} ms".format(
+                            web_framework,
+                            test_connection,
+                            processing_time_ms,
+                            pipeline,
+                            result_data[
+                                "rps"], q50))
+                    time.sleep(args.sleep_between_runs_secs)
     progress.close()
 
     with open(args.output_file, "w") as json_file:
