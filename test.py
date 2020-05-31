@@ -173,7 +173,7 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
     web_framework_process = subprocess.Popen(args=web_framework_args, **options)
     if debug:
         print("Waiting for web framework to be ready...")
-    wait_for_webserver(endpoint, debug)
+    wait_for_webserver("{}/hello".format(endpoint), debug)
     if debug:
         print("Ready to benchmark...")
 
