@@ -317,16 +317,16 @@ if __name__ == "__main__":
                                                              pipeline)
                     overall_results[web_framework][connection_key][processing_time_key][pipeline_key] = result_data
                     progress.update()
-                    q50 = result_data[
-                        "uncorrected"][0.5]
+                    q50 = None
+                    if 0.5 in result_data["uncorrected"]:
+                        q50 = result_data["uncorrected"][0.5]
                     print(
                         "Framework {}, connections {}, mocked processing time {} ms, pipeline {}. RPS {} rps. q50 {} ms".format(
                             web_framework,
                             test_connection,
                             processing_time_ms,
                             pipeline,
-                            result_data[
-                                "rps"], q50))
+                            result_data["rps"], q50))
                     time.sleep(args.sleep_between_runs_secs)
     progress.close()
 
