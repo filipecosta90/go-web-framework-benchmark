@@ -50,7 +50,7 @@ def required_utilities(utility_list, debug):
     return result
 
 
-def wait_for_webserver(endpoint, debug, retries=10):
+def wait_for_webserver(endpoint, debug, retries=30):
     result = False
     while retries > 0:
         try:
@@ -59,7 +59,7 @@ def wait_for_webserver(endpoint, debug, retries=10):
         except urllib.error.URLError as e:
             if debug:
                 print("...waiting for webserver to be ready")
-            time.sleep(0.1)
+            time.sleep(1)
             retries -= 1
     return result
 
