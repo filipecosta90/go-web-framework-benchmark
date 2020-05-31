@@ -197,7 +197,9 @@ def test_web_framework(wrk_full_path, server_bin_name, web_framework, processing
         web_framework_process.wait(5)
         if debug:
             print("{} process exited successfully".format(web_framework))
-
+    except subprocess.TimeoutExpired as e:
+        print('Timeout caught while waiting for {0} process to end: {1}'.format(web_framework, e.__str__()))
+        pass
     except OSError as e:
         print('OSError caught while waiting for {0} process to end: {1}'.format(web_framework, e.__str__()))
         pass
